@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+MEM_BIN="${MEM_BIN:-__MEM_BIN__}"
+
+if [ ! -x "$MEM_BIN" ]; then
+  echo "mem: MEM_BIN not executable: $MEM_BIN" >&2
+  exit 0
+fi
+
+msg=$(git log -1 --pretty=%s 2>/dev/null || printf '')
+
+"$MEM_BIN" init
+"$MEM_BIN" add commit msg="$msg"
+"$MEM_BIN" sync

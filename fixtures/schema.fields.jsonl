@@ -1,0 +1,7 @@
+{"type":"field","field":"ts","first_type":"string","types":["string"],"conflict":false}
+{"type":"field","field":"type","first_type":"string","types":["string"],"conflict":false}
+{"type":"field","field":"cwd","first_type":"string","types":["string"],"conflict":false}
+{"type":"field","field":"git_sha","first_type":"string","types":["string"],"conflict":false}
+{"type":"field","field":"git_branch","first_type":"string","types":["string"],"conflict":false}
+{"type":"field","field":"msg","first_type":"string","types":["string"],"conflict":false}
+{"type":"summary","lines":1,"records":1,"fields":6,"conflicts":0}

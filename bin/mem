@@ -1,0 +1,326 @@
+#!/bin/sh
+set -eu
+
+MEM_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PATH="$MEM_ROOT/tools/kv/bin:$MEM_ROOT/tools/jsonl:$MEM_ROOT/tools/jd/bin:$PATH"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: mem <command> [args]
+
+commands:
+  init
+  add TYPE [k=v ...]
+  sync
+  show
+USAGE
+}
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "mem: missing dependency: $1" >&2
+    exit 2
+  fi
+}
+
+get_root() {
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    git rev-parse --show-toplevel
+  else
+    pwd
+  fi
+}
+
+init_paths() {
+  ROOT=$(get_root)
+  ROOT=$(cd "$ROOT" && pwd)
+  MEMDIR="$ROOT/.amcb/memory"
+  EVENTS="$MEMDIR/events.jsonl"
+  SCHEMA="$MEMDIR/schema.fields.jsonl"
+  DRIFT="$MEMDIR/drift.jsonl"
+  STATE="$MEMDIR/state.json"
+  MEMORY_MD="$MEMDIR/MEMORY.md"
+  TMPDIR="$MEMDIR/tmp"
+
+  case "$MEMDIR" in
+    "$ROOT"/*) : ;;
+    *)
+      echo "mem: invalid memory path" >&2
+      exit 2
+      ;;
+  esac
+}
+
+ensure_init() {
+  init_paths
+  if [ ! -d "$MEMDIR" ]; then
+    echo "mem: .amcb/memory missing (run 'mem init')" >&2
+    exit 2
+  fi
+  if [ ! -f "$EVENTS" ]; then
+    echo "mem: events.jsonl missing (run 'mem init')" >&2
+    exit 2
+  fi
+}
+
+write_initial_state() {
+  if [ ! -f "$STATE" ]; then
+    printf '%s\n' '{"counters":{"events_total":0,"by_type":{}},"last":{"ts":"","type":"","git_sha":"","git_branch":""},"drift":{"detected":false,"events":0}}' > "$STATE"
+  fi
+}
+
+write_initial_memory_md() {
+  if [ ! -f "$MEMORY_MD" ]; then
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$MEMORY_MD" <<EOF
+# Memory
+Updated UTC: $ts
+Events: 0
+Drift: detected=false events=0
+
+## Recent events
+```jsonl
+```
+EOF
+  fi
+}
+
+cmd_init() {
+  need_cmd jq
+  need_cmd jd
+
+  init_paths
+  mkdir -p "$TMPDIR"
+
+  if [ ! -f "$EVENTS" ]; then
+    : > "$EVENTS"
+  fi
+
+  if [ ! -s "$SCHEMA" ]; then
+    if [ -s "$EVENTS" ]; then
+      if ! cat "$EVENTS" | jd fields > "$SCHEMA"; then
+        echo "mem: failed to generate schema baseline" >&2
+        exit 2
+      fi
+    else
+      : > "$SCHEMA"
+    fi
+  fi
+
+  write_initial_state
+  write_initial_memory_md
+}
+
+quote_kv_line() {
+  # Build a single kv line with quoted values for safe parsing.
+  out=""
+  for pair in "$@"; do
+    case "$pair" in
+      *=*)
+        key=${pair%%=*}
+        val=${pair#*=}
+        esc=$(printf '%s' "$val" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        out="$out$key=\"$esc\" "
+        ;;
+      *)
+        out="$out$pair "
+        ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
+cmd_add() {
+  if [ $# -lt 1 ]; then
+    usage
+    exit 2
+  fi
+
+  need_cmd jq
+  need_cmd kv
+  need_cmd jsonl
+
+  type=$1
+  shift || true
+
+  ensure_init
+
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  cwd=$(pwd)
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_sha=$(git rev-parse HEAD 2>/dev/null || printf '')
+    git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf '')
+  else
+    git_sha=""
+    git_branch=""
+  fi
+
+  extra_json='{}'
+  if [ $# -gt 0 ]; then
+    kv_line=$(quote_kv_line "$@")
+    if ! extra_json=$(printf '%s\n' "$kv_line" | kv json --delim equals 2>/dev/null); then
+      echo "mem: invalid k=v input" >&2
+      exit 2
+    fi
+  fi
+
+  event=$(printf '%s\n' "$extra_json" | jq -c -n \
+    --arg ts "$ts" \
+    --arg type "$type" \
+    --arg cwd "$cwd" \
+    --arg git_sha "$git_sha" \
+    --arg git_branch "$git_branch" \
+    '(input // {}) + {ts:$ts,type:$type,cwd:$cwd,git_sha:$git_sha,git_branch:$git_branch}')
+
+  if ! printf '%s\n' "$event" | jsonl validate >/dev/null 2>&1; then
+    echo "mem: generated event is invalid" >&2
+    exit 2
+  fi
+
+  printf '%s\n' "$event" >> "$EVENTS"
+}
+
+cmd_sync() {
+  need_cmd jq
+  need_cmd jd
+  need_cmd jsonl
+
+  ensure_init
+
+  set +e
+  scan_out=$(jd scan < "$EVENTS" 2>/dev/null)
+  scan_status=$?
+  set -e
+  if [ $scan_status -ne 0 ]; then
+    printf '%s\n' "$scan_out" >&2
+    exit 2
+  fi
+
+  if [ ! -s "$SCHEMA" ]; then
+    if [ -s "$EVENTS" ]; then
+      if ! cat "$EVENTS" | jd fields > "$SCHEMA"; then
+        echo "mem: failed to generate schema baseline" >&2
+        exit 2
+      fi
+    else
+      : > "$SCHEMA"
+    fi
+  fi
+
+  if [ -s "$EVENTS" ]; then
+    set +e
+    jd drift --baseline "$SCHEMA" < "$EVENTS" > "$DRIFT"
+    drift_status=$?
+    set -e
+    if [ $drift_status -eq 2 ]; then
+      echo "mem: failed to compute drift" >&2
+      exit 2
+    fi
+  else
+    : > "$DRIFT"
+  fi
+
+  drift_events=$(jq -c 'select(.type != "summary")' "$DRIFT" 2>/dev/null | wc -l | tr -d ' ')
+  if [ -z "$drift_events" ]; then
+    drift_events=0
+  fi
+  if [ "$drift_events" -gt 0 ]; then
+    drift_detected=true
+  else
+    drift_detected=false
+  fi
+
+  if [ -s "$EVENTS" ]; then
+    events_total=$(jsonl count < "$EVENTS" | jq -r '.count')
+  else
+    events_total=0
+  fi
+
+  by_type=$(jq -s 'map(.type) | group_by(.) | map({(.[0]): length}) | add // {}' "$EVENTS" 2>/dev/null)
+
+  if [ "$events_total" -gt 0 ]; then
+    last=$(tail -n 1 "$EVENTS" | jq -c '{ts, type, git_sha, git_branch}')
+  else
+    last='{"ts":"","type":"","git_sha":"","git_branch":""}'
+  fi
+
+  state=$(jq -c -n \
+    --argjson events_total "$events_total" \
+    --argjson by_type "$by_type" \
+    --argjson last "$last" \
+    --argjson drift_detected "$drift_detected" \
+    --argjson drift_events "$drift_events" \
+    '{counters:{events_total:$events_total,by_type:$by_type},last:$last,drift:{detected:$drift_detected,events:$drift_events}}')
+
+  printf '%s\n' "$state" > "$STATE"
+
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  {
+    printf '# Memory\n'
+    printf 'Updated UTC: %s\n' "$ts"
+    printf 'Events: %s\n' "$events_total"
+    printf 'Drift: detected=%s events=%s\n\n' "$drift_detected" "$drift_events"
+    printf '## Recent events\n'
+    printf '```jsonl\n'
+    if [ -s "$EVENTS" ]; then
+      tail -n 25 "$EVENTS"
+    fi
+    printf '\n```\n'
+
+    if [ "$drift_detected" = true ]; then
+      printf '\n## Drift events\n'
+      printf '```jsonl\n'
+      jq -c 'select(.type != "summary")' "$DRIFT" 2>/dev/null | tail -n 50
+      printf '\n```\n'
+    fi
+  } > "$MEMORY_MD"
+}
+
+cmd_show() {
+  need_cmd jq
+  ensure_init
+
+  if [ ! -f "$STATE" ]; then
+    echo "mem: state.json missing (run 'mem sync')" >&2
+    exit 2
+  fi
+
+  summary=$(cat "$STATE")
+  drift_detected=$(printf '%s\n' "$summary" | jq -r '.drift.detected')
+  drift_events=$(printf '%s\n' "$summary" | jq -r '.drift.events')
+
+  printf 'MEM SUMMARY\n'
+  printf '%s\n' "$summary"
+  printf '\nRECENT EVENTS (jsonl)\n'
+  if [ -s "$EVENTS" ]; then
+    tail -n 25 "$EVENTS"
+  fi
+
+  if [ "$drift_detected" = true ] && [ -s "$DRIFT" ]; then
+    printf '\nDRIFT (jsonl)\n'
+    jq -c 'select(.type != "summary")' "$DRIFT" 2>/dev/null | tail -n 50
+  fi
+}
+
+command=${1:-}
+shift || true
+
+case "$command" in
+  init)
+    cmd_init
+    ;;
+  add)
+    cmd_add "$@"
+    ;;
+  sync)
+    cmd_sync
+    ;;
+  show)
+    cmd_show
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

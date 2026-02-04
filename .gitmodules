@@ -1,0 +1,9 @@
+[submodule "tools/kv"]
+	path = tools/kv
+	url = https://github.com/amcbstudio/kv.git
+[submodule "tools/jsonl"]
+	path = tools/jsonl
+	url = https://github.com/amcbstudio/jsonl.git
+[submodule "tools/jd"]
+	path = tools/jd
+	url = https://github.com/amcbstudio/jd.git
